@@ -5,11 +5,14 @@
 (eval-when (:compile-toplevel)
   (setf *compile-code-coverage* nil)
   (setf *disassemble-verbose* t)
-  (setf *warn-if-redefine-kernel* nil))
+  (setf *warn-if-redefine-kernel* nil)
+  (setf *print-circle* t *print-length* 50 *print-level* 5))
 
 (defstruct ms fld)
 
 (defparameter *graal* (cons 0 0))
+
+(defparameter *the-print* #'print)
 
 (declaim (notinline parameterless))
 (proclaim '(notinline parameterless))
@@ -20,7 +23,16 @@
   (setf (car *graal*) 1)
   (values))
 
-(defun ccl::f (x y)
+
+(defun ccl::f ()
+  (print 'list)
+  )
+
+(defun g ()
+  (ccl::f))
+
+#|(defun ccl::f (x y)
   (declare (notinline cons))
   ; (parameterless)
-  (cons x y))
+  ;(cons x y)
+  (print x))|#
