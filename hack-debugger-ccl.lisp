@@ -36,8 +36,9 @@
 
 (import '(step-continue step-over step-out step-into) :cl-user)
 
-
-(proclaim '(optimize (space 0) (speed 0) (debug 3) (compilation-speed 0)))
+;; It is essential. In low debug, there are almost no calls
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (proclaim '(optimize (space 0) (speed 0) (debug 3) (compilation-speed 0))))
 
 
 (defvar *tracing-enabled* t "If true, step points are printed")
@@ -64,31 +65,64 @@
 
 ; FIXME this is a trash! Replace with a weak hash-table where weak key is a stepped function object and value is nil
 (defvar *active-steppoints* nil "list of created breakpoints")
-(defparameter *non-steppable-calls* '(
+
+
+;; CONCEPTS
+(defparameter *concepts*
+  "Stepizable is a function which we can instrument for stepping
+   Steppable is a function such that we can step in. 
+
+   CONS is neither steppable nor stepizable
+   FUNCALL is steppable, but not stepizable 
+   SOME-USER-FUN is both steppable and stepizable
+   PRINT might form another class: it is steppable, but stepping is disabled in recursive calls, otherwise we die immediately. We still have no concept for that, so print is neither steppable nor stepizable (and we can't step inside printing)")
+
+(defparameter *non-steppable-calls* `(
                                       invoke-debugger
+                                      run-steppoint
+                                      stop-stepping
                                       ;dbg::get-call-frame
                                       ;dbg::debug1
                                       ;conditions::in-break
                                       ;runtime:bad-args-or-stack ; useless
                                       break ; bad things would happen
-                                      ) 
-  "Functions call to which we don't touch while making function steppable")
+                                      backtrace-as-list
+                                      activate-stepping-and-do-first-step
+                                      swank/backend:activate-stepping
+                                      swank/backend:sldb-step-into
+                                      CCL::RUN-PROCESS-INITIAL-FORM
+                                      )
+  "Functions call to which we don't touch while making function steppable. Difference with *non-stepizable-fns* is a bit fuzzy...")
 
-(defvar *non-stepizable-fns*
-  '(run-steppoint ! stop-stepping)
-  "Functions we never trying to stepize in additional to functions in protected packages")
+(defparameter *stepizibility-per-symbol* 
+  `(
+    (invoke-debugger nil)
+    (ccl::cheap-eval nil)
+    (funcall nil)
+    (ccl::call-check-regs nil)
+    (,(intern "EVAL-FOR-EMACS-RT" :swank) nil)
+    (ccl::cbreak-loop nil)
+    (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::TRACK-PACKAGE)| nil)
+    (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::REPL-EVAL)| nil)
+    )
+  "Stepizibility per symbol takes priority over that of package")
 
-(defparameter *packages-of-non-stepizable-functions*
-  nil
-  "Calls to functions in that packages can be step points, but we never step into those functions.
-  Take them into our variable so that don't lose in a situation where *packages-for-warn-on-redefinition* is bound to nil"
-  )
-
-
+(defparameter *stepizibility-per-package*
+  `((,(find-package :swank) nil)
+    (,(find-package :swank/backend) nil)
+    (,(find-package :swank/ccl) nil)
+    (,(find-package :swank-repl) nil)
+    (,(find-package :clco) :ask-user)
+    (,(find-package :oduvanchik) :ask-user)
+    (,(find-package :native-code-stepper) nil)
+    (,(find-package :ccl) :ask-user)
+    )
+  "Order is important, because a symbol can be in many packages. 
+Packages are asked from top to bottom, the first one mentioned yields an answer for the symbol")
+    
 (defun setf-*stepping-enabled* (value)
   #+ncsdbg (format t "~%setting *stepping-enabled* to ~A~%" value)
   (setf *stepping-enabled* value))
-
 
 ; information of a steppoint for a step-point
 (defstruct steppoint-info fn offsets old-called kind)
@@ -106,68 +140,27 @@
 ;;---  CAN WE STEP THIS? -----------------------------------------------------------------------
 ;;----------------------------------------------------------------------------------------------
 
-(defun call-steppable-p (call-into call-kind)
+(defun call-allowed-to-stepize-p (call-into)
   "Can we stop at this call"
-  (when (= call-kind 0)
-       ; don't attempt to step direct calls as they
-       ; use stack in some other way.
-    (return-from call-steppable-p
-      (cond
-       ((search "subfunction of lambda-fact" (format nil "~A" call-into)) t)
-       ((search "sub-with-no-args" (format nil "~A" call-into)) t)
-       (t nil))))
   (typecase call-into
+    ((satisfies steppoint-symbol-p)
+     nil)
     (symbol
-     (and 
-      (not (member call-into *non-steppable-calls*))
-      (not (= call-kind 0))))
-    (function 
-     (not (member (coerce call-into 'function) *non-steppable-calls* :key (lambda (x) (coerce x 'function)))))
+     (cond
+      ((member call-into *non-steppable-calls*)
+       nil)
+      (t
+       (let ((entry
+              (or
+               (assoc call-into *stepizibility-per-symbol*)
+               (assoc (symbol-package call-into) *stepizibility-per-package*))))
+         (or
+          (not entry)
+          (second entry))))))
+    #| (function ; FIXME
+        (not (member (coerce call-into 'function) *non-steppable-calls* :key (lambda (x) (coerce x 'function))))) |#
     (t ; other constants, e.g. numbers. 
      nil)))
-    
-
-(defun package-is-not-for-stepping-p (p)
-  "Accepts nil, package, or package name"
-  (etypecase p
-    (package
-     (package-is-not-for-stepping-p (package-name p)))
-    (null
-     nil)
-    ((or symbol string)
-     (member p *packages-of-non-stepizable-functions* :test 'string=))
-    ))
-
-
-(defun symbol-of-package-not-for-stepping-p (s)
-  "S can be anything, including non-symbol, in this case we return nil"
-  (and (symbolp s)
-       (package-is-not-for-stepping-p (symbol-package s))))
-
-(defun stepizible-function-name-p (fn-name)
-  "Can we step into a function?"
-  (cond
-   ((member fn-name *non-steppable-calls*) nil)
-   ((member fn-name *non-stepizable-fns*) nil)
-   ((frm-never-stop-complex-name-p fn-name) nil)
-   ((symbol-of-package-not-for-stepping-p fn-name) nil)
-   (t t)))
-
-
-(defun frm-never-stop-complex-name-p (name)
-  "Some forms are parts of stepper. Never stop on them, 
-  never show their source"
-  (and
-   (consp name)
-   (or
-    (eq (third name) 'stepize-fn-for-one-called)
-    (some 'symbol-of-package-not-for-stepping-p
-          (cdr name))
-    (and
-     (consp (third name))
-     (frm-never-stop-complex-name-p (third name))
-    ))))
-
 
 (defun make-long-living-symbol (name)
   (progn 
@@ -175,12 +168,38 @@
                           :steppoint-symbols-temporary-package)))
       symbol)))
 
-
 (defun steppoint-symbol-p (x)
   "steppoint symbol names a function call to which is substituted instead of original function call in a code"
   (and (symbolp x)
        (typep (get x 'steppoint-info) 'steppoint-info)))
 
+(defun stepize-stack ()
+  (let ((commands-left-to-stepize 2))
+    (dolist (entry (ccl::backtrace-as-list :count 250))
+      (let* ((call-into (first entry))
+             (allowed-to-stepize-p (call-allowed-to-stepize-p call-into))
+             (stepized-already
+              (function-is-stepized-p call-into))
+             (stepize-p
+              (ecase stepized-already
+                ((t)
+                 (incf commands-left-to-stepize -1)
+                 nil)
+                (:empty
+                 (incf commands-left-to-stepize -1)
+                 nil)
+                ((nil)
+                 (case allowed-to-stepize-p
+                   ((nil) nil)
+                   (:ask-user
+                    (when (y-or-n-p "Stepize ~S?" call-into)
+                      (incf commands-left-to-stepize -1)))
+                   (t
+                    t))))))
+        (when stepize-p
+          (stepize-fn call-into)))
+      (when (eql commands-left-to-stepize 0)
+        (return)))))
   
 ;;----------------------------------------------------------------------------------------------
 ;;---- STUDY OF STACK FRAMES AND OPERATIONS ON THEM ------------------------------------------------------------
@@ -271,14 +290,22 @@ FIXME - take from SLIME
     (symbol (fboundp x))
     (t nil)))
 
-(defun function-has-step-points-p (function-or-name)
-  "Are there step point in function now?"
-  (let* ((fn (coerce function-or-name 'function)))
-    (ccl::lfunloop for reference in fn
-                   when (steppoint-symbol-p reference)
-                   return t)
-    nil))
+(defvar *functions-known-to-have-no-stepizable-points*
+  (make-hash-table :test 'eq :weak :key))
 
+(defun function-is-stepized-p (function-or-name)
+  "Are there step point in function now?"
+  (let* ((fn (coerce function-or-name 'function))
+         (known-to-have-no-stepizable-points
+          (gethash fn *functions-known-to-have-no-stepizable-points*))
+         (actually-stepized-p 
+          (ccl::lfunloop for reference in fn
+                         when (steppoint-symbol-p reference)
+                         return t)))
+    (cond
+     (actually-stepized-p t)
+     (known-to-have-no-stepizable-points :empty)
+     (t nil))))
 
 (defun function-constants (fn)
   (ccl::lfunloop for reference in (coerce fn 'function)
@@ -381,12 +408,20 @@ FIXME - take from SLIME
           (step-into ()
                      :report "Step into"
                      (setf *step-into-flag* t)
+                     ;; FIXME
+                     ;; note that we stepize no more than 2 stack levels, 
+                     ;; so in case function throws, we'll lose
+                     ;; we could stepize the entire stack, or catch
+                     ;; non-local exits from fn somehow
+                     (stepize-stack)
                      )) ; result does not matter
         
         ; step-* functions are called from break that may stepize other functions 
         ; and/or set *step-into-flag*
         (setf-*stepping-enabled* *step-into-flag*))
-      (apply call-to call-args)))
+      (apply call-to call-args)
+      ;; FIXME it would be better to step AFTER returning also!
+      ))
    (t
     (apply call-to call-args)
     )))
@@ -409,4 +444,23 @@ FIXME - take from SLIME
 
 (defun stop-stepping ()
   (setf *stepping-enabled* nil))
+
+(defun t2 ()
+  (stepize-fn 'ccl::compile-named-function)
+  (let ((*stepping-enabled* t))
+    (eval '(compile (defun f () (print 'list))))))
+
+
+(defun activate-stepping-and-do-first-step (frame)
+  (declare (ignore frame))
+  (assert (not *stepping-enabled*))
+  (setf *stepping-enabled* t)
+  ;; (pprint (ccl::backtrace-as-list :count 50))
+  ;; FIXME - see FIXME near other use of stepize-stack
+  (stepize-stack)
+  (cond
+   ((find-restart 'continue)
+    (invoke-restart 'continue))
+   (t
+    (swank/ccl::loud-message "No continue restart - unable to do the first step. Please invoke an appropriate restart by hand"))))
 
