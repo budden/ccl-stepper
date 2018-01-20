@@ -42,7 +42,7 @@
   (proclaim '(optimize (space 0) (speed 0) (debug 3) (compilation-speed 0))))
 
 
-(defvar *tracing-enabled* t "If true, step points are printed")
+(defparameter *tracing-enabled* nil "If true, step points are printed")
 (defparameter *stepping-enabled* nil ; FIXME this is defparameter as we unable to reset it when stepping out
   ; of lowest steppable frame. So if we switched from execution to stepping we normally dont' switch back until 
   ; user issues "step-continue" command at some point.
@@ -397,24 +397,24 @@ FIXME - take from SLIME
 
 (defmacro with-stepper-restarts (&body body)
   `(let ( ; bindings for break only
-         (*step-into-flag* nil) 
+         ; (*step-into-flag* nil) 
          #|
          (DBG::*hidden-symbols*
           (append '(break run-steppoint invoke-debugger stepize-fn-for-one-called) DBG::*hidden-symbols*)) |#
          (*stepper-call-to* call-to)
          (*in-run-steppoint* t)
          (*stepped-source-is-shown-already-in-the-debugger* nil))
+     (setf-*stepping-enabled* nil)
      (restart-case
          (let (#+SWANK (swank::*sldb-quit-restart* (find-restart 'step-continue)))
            ,@body
            )
-       (step-continue ()  :report "Continue")
        ; (step-out )
        ; (step-next )
        (step-into ()
-                  :report "Step into"
-                  (setf *step-into-flag* t)
-                  (stepize-stack)
+                  :report "Step"
+                  (setf-*stepping-enabled* t)
+                  ;;; It is noop for now FIXME (stepize-stack)
                   )) ; result does not matter
      ))
      
@@ -427,22 +427,18 @@ FIXME - take from SLIME
    (*stepping-enabled*
     (let ( ; bindings for both break and apply
           (*step-over-flag* nil)
-          ; (*stepping-enabled* nil) ; so that :c is a continue
           )
       (with-stepper-restarts
        (break "Step: before call from ~S~
                ~%  to ~S with args=~S~%"
               call-from call-to call-args))
-      ; step-* functions are called from break that may stepize other functions 
-      ; and/or set *step-into-flag*
-      (setf-*stepping-enabled* *step-into-flag*))  
-    
       (let ((result (multiple-value-list (apply call-to call-args))))
-        (with-stepper-restarts
-         (break "Step after: call from ~S~
-                 ~%  to ~S returned (values~{ ~S~})"
-                call-from call-to result))
-        (values-list result)))
+        (when *stepping-enabled*
+          (with-stepper-restarts
+           (break "Step after: call from ~S~
+                   ~%  to ~S returned (values~{ ~S~})"
+                  call-from call-to result)))
+        (values-list result))))
    (t
     (apply call-to call-args))))
 
