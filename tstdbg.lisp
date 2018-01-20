@@ -2,10 +2,12 @@
 
 (in-package :native-code-stepper)
 
-(print '#.(intern "F2" :cl-user))
+;;(print '#.(intern "F2" :cl-user))
 
+;;(eval-when (:compile-toplevel)
+;;  (trace :break t ccl::compile-named-function))
+  
 (defun cl-user::f2 (n)
-  (break)
-  (if (<= n 1) 1
-      (* n (cl-user::f2 (- n 1)))))
+  (break "SDF")
+  (<= n 4))
 

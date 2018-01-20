@@ -10,6 +10,7 @@
 (eval-when (:compile-toplevel :load-toplevel)
   (defpackage :native-code-stepper
     (:use :cl :ccl)
+    (:shadowing-import-from :cl-user :step-into)
     (:export
      #:! ; step given function with args
 
@@ -91,9 +92,11 @@
                                       swank/backend:activate-stepping
                                       swank/backend:sldb-step-into
                                       CCL::RUN-PROCESS-INITIAL-FORM
+                                      ccl::%kernel-restart
                                       )
   "Functions call to which we don't touch while making function steppable. Difference with *non-stepizable-fns* is a bit fuzzy...")
 
+;; Functions which we never instrument with step point wrappers
 (defparameter *stepizibility-per-symbol* 
   `(
     (invoke-debugger nil)
@@ -104,6 +107,8 @@
     (ccl::cbreak-loop nil)
     (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::TRACK-PACKAGE)| nil)
     (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::REPL-EVAL)| nil)
+    (CCL::BREAK-LOOP-HANDLE-ERROR nil)
+    (CCL::%ERROR nil)
     )
   "Stepizibility per symbol takes priority over that of package")
 
@@ -141,7 +146,7 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
 ;;----------------------------------------------------------------------------------------------
 
 (defun call-allowed-to-stepize-p (call-into)
-  "Can we stop at this call"
+  "Should we instrument the call to this function from other function?"
   (typecase call-into
     ((satisfies steppoint-symbol-p)
      nil)
@@ -174,12 +179,12 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
        (typep (get x 'steppoint-info) 'steppoint-info)))
 
 (defun stepize-stack ()
-  (let ((commands-left-to-stepize 2))
+  #|(let ((commands-left-to-stepize 2))
     (dolist (entry (ccl::backtrace-as-list :count 250))
-      (let* ((call-into (first entry))
-             (allowed-to-stepize-p (call-allowed-to-stepize-p call-into))
+      (let* ((fn-name-on-stack (first entry))
+             (allowed-to-stepize-p (call-allowed-to-stepize-p fn-name-on-stack))
              (stepized-already
-              (function-is-stepized-p call-into))
+              (function-is-stepized-p fn-name-on-stack))
              (stepize-p
               (ecase stepized-already
                 ((t)
@@ -192,14 +197,14 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
                  (case allowed-to-stepize-p
                    ((nil) nil)
                    (:ask-user
-                    (when (y-or-n-p "Stepize ~S?" call-into)
+                    (when (y-or-n-p "Stepize ~S?" fn-name-on-stack)
                       (incf commands-left-to-stepize -1)))
                    (t
                     t))))))
         (when stepize-p
-          (stepize-fn call-into)))
+          (stepize-fn fn-name-on-stack)))
       (when (eql commands-left-to-stepize 0)
-        (return)))))
+        (return))))|#)
   
 ;;----------------------------------------------------------------------------------------------
 ;;---- STUDY OF STACK FRAMES AND OPERATIONS ON THEM ------------------------------------------------------------
@@ -313,36 +318,47 @@ FIXME - take from SLIME
 
 
 (defun stepize-fn (function-or-name)
-  "Find all steppable points from compiled function and set steppoints where possible"
+  "Find all steppable points from compiled function and set steppoints where possible. Might insert no step points actually, if all calls are not call-allowed-to-stepize-p"
   #+ncsdbg (format t "~%stepizing ~S~%" function-or-name)
-  (cond
-   ((steppoint-symbol-p function-or-name)
-    (error "attemp to step steppoint-symbol"))
-   ((function-has-step-points-p function-or-name)
-    ; steppoints are set already - do nothing
-    )
-   (t
-    (let* ((fn (coerce function-or-name 'function))
-           (indices
-            (ccl::lfunloop
-             for reference in fn for i from 0
-             do (when (typep reference
-                             '(cons
-                               (eql ccl::indices-of-function-references-in-constant-array)))
-                  (return (cdr reference))))))
-      (warn "Indices = ~S, constants = ~S" indices (function-constants fn))
-      (cond
-       (indices
-        (ccl::lfunloop for reference in fn for i from ccl::+function-immediate-constants-are-counted-from+
-                       do (when (find i indices)
-                            (assert
-                             (function-designator-p reference) ()
-                             "Something wrong - attempting to stepise a non-function-designator")
-                            #+ncsdbg (format t "~&stepizing ~S -> ~S~%" fn reference)
-                            (stepize-fn-for-one-called fn reference i))))
-       (t
-        (warn "Unable to stepize ~S - it has no steppable points" function-or-name)))))))
-
+  (let ((steppoint-symbol-p-v (steppoint-symbol-p function-or-name))
+        (function-is-stepized-p-v
+         (function-is-stepized-p function-or-name)))
+    (cond
+     (steppoint-symbol-p-v
+      (error "attemp to stepize steppoint-symbol"))
+     ((eq function-is-stepized-p-v :empty)
+      (swank/ccl::loud-message "Function ~S to stepize has no steppable points"
+                    function-or-name))
+     ((eq function-is-stepized-p-v t)
+      ; steppoints are set already - do nothing
+      )
+     (t
+      (gc)
+      (ccl::without-gcing
+       (let* ((fn (coerce function-or-name 'function))
+             (indices
+              (ccl::lfunloop
+               for reference in fn for i from 0
+               do (when (typep reference
+                               '(cons
+                                 (eql ccl::indices-of-function-references-in-constant-array)))
+                    (return (cdr reference)))))
+             (no-of-steppoints 0))
+        (warn "Indices = ~S, constants = ~S" indices (function-constants fn))
+        (cond
+         (indices
+          (ccl::lfunloop for reference in fn for i from ccl::+function-immediate-constants-are-counted-from+
+                         do (when (find i indices)
+                              (assert
+                               (function-designator-p reference) ()
+                               "Something wrong - attempting to stepise a non-function-designator")
+                              (when (call-allowed-to-stepize-p reference)
+                                #+ncsdbg (format t "~&stepizing ~S -> ~S~%" fn reference)
+                                (stepize-fn-for-one-called fn reference i)
+                                (incf no-of-steppoints)))))
+         (t
+          (warn "Unable to stepize ~S - it has no steppable points" function-or-name)))))))))
+  
 (defun stepize-fn-for-one-called (fn reference i)
   "fn is a function, reference is a function-designator-p . Set steppoints for one reference. 
   Breakpoint is indeed a closure and a change in a function references (immediates).
@@ -352,7 +368,8 @@ FIXME - take from SLIME
     (let*
         ((steppoint-symbol
           (cond
-           ((symbolp reference)
+           ((and (symbolp reference)
+                 (symbol-package reference))
             (make-long-living-symbol
              (concatenate
               'string
@@ -378,6 +395,29 @@ FIXME - take from SLIME
   "There is a ready steppoint. Change the code of fn to call it."
   (ccl::set-nth-immediate fn i steppoint-symbol))
 
+(defmacro with-stepper-restarts (&body body)
+  `(let ( ; bindings for break only
+         (*step-into-flag* nil) 
+         #|
+         (DBG::*hidden-symbols*
+          (append '(break run-steppoint invoke-debugger stepize-fn-for-one-called) DBG::*hidden-symbols*)) |#
+         (*stepper-call-to* call-to)
+         (*in-run-steppoint* t)
+         (*stepped-source-is-shown-already-in-the-debugger* nil))
+     (restart-case
+         (let (#+SWANK (swank::*sldb-quit-restart* (find-restart 'step-continue)))
+           ,@body
+           )
+       (step-continue ()  :report "Continue")
+       ; (step-out )
+       ; (step-next )
+       (step-into ()
+                  :report "Step into"
+                  (setf *step-into-flag* t)
+                  (stepize-stack)
+                  )) ; result does not matter
+     ))
+     
 (defun run-steppoint (call-from call-to call-args)
   "Run through steppoint. Break if appropriate. Debugger functions will do the rest"
   (when *tracing-enabled*
@@ -388,46 +428,23 @@ FIXME - take from SLIME
     (let ( ; bindings for both break and apply
           (*step-over-flag* nil)
           ; (*stepping-enabled* nil) ; so that :c is a continue
-          ) 
-      (let ( ; bindings for break only
-            (*step-into-flag* nil) 
-            #|
-            (DBG::*hidden-symbols*
-             (append '(break run-steppoint invoke-debugger stepize-fn-for-one-called) DBG::*hidden-symbols*)) |#
-            (*stepper-call-to* call-to)
-            (*in-run-steppoint* t)
-            (*stepped-source-is-shown-already-in-the-debugger* nil))
-        (restart-case
-            (let (#+SWANK (swank::*sldb-quit-restart* (find-restart 'step-continue)))
-              (break "Step: before call from ~S~
-                      ~%  to ~S with args=~S~%"
-                     call-from call-to call-args))
-          (step-continue ()  :report "Continue")
-          ; (step-out )
-          ; (step-next )
-          (step-into ()
-                     :report "Step into"
-                     (setf *step-into-flag* t)
-                     ;; FIXME
-                     ;; note that we stepize no more than 2 stack levels, 
-                     ;; so in case function throws, we'll lose
-                     ;; we could stepize the entire stack, or catch
-                     ;; non-local exits from fn somehow
-                     (stepize-stack)
-                     )) ; result does not matter
-        
-        ; step-* functions are called from break that may stepize other functions 
-        ; and/or set *step-into-flag*
-        (setf-*stepping-enabled* *step-into-flag*))
-      (apply call-to call-args)
-      ;; FIXME it would be better to step AFTER returning also!
-      ))
-   (t
-    (apply call-to call-args)
-    )))
-
+          )
+      (with-stepper-restarts
+       (break "Step: before call from ~S~
+               ~%  to ~S with args=~S~%"
+              call-from call-to call-args))
+      ; step-* functions are called from break that may stepize other functions 
+      ; and/or set *step-into-flag*
+      (setf-*stepping-enabled* *step-into-flag*))  
     
-
+      (let ((result (multiple-value-list (apply call-to call-args))))
+        (with-stepper-restarts
+         (break "Step after: call from ~S~
+                 ~%  to ~S returned (values~{ ~S~})"
+                call-from call-to result))
+        (values-list result)))
+   (t
+    (apply call-to call-args))))
 
 ;;-------------------------------------------------------
 ;;-------------------------------- INTERFACE ------------
