@@ -53,8 +53,22 @@ CCL::X862-GENERATE-PC-SOURCE-MAP
 Наверное, надо разобраться как идёт инфа по компилятору. 
 
 
-итак - 
-1. Сделать запрос y-or-n-p более приличным. 
-2. В break кнопки f5 и f11 всегда должны иметь смысл. Возможно, f11 должна предупреждать, если не stepizible. 
+ХОДИМ ПО КОМПИЛЯТОРУ
+====================
+CCL::NX1-LAMBDA возвращает что-то вроде:
+
+#<ACODE progn ((#<ACODE values ((#<ACODE call (#<ACODE immediate (BREAK)>
+                                                                                                         (NIL
+                                                                                                           (#<ACODE immediate ("SDF")>))
+
+После ccl::rewrite-acode-form получили, в частности, 
+
+<ACODE call (#<ACODE immediate (<=)> (NIL (#<ACODE fixnum (4)> #<ACODE lexical-reference (#<VAR N #x302003C40EED>)>)) NIL)>
+acode.info = (T . #<SOURCE-NOTE "/y/yar/ccl-stepper/tstdbg.lisp":227-235 "(<= n 4)">)
+
+Т.е. тут пока вся нужная информация вместе. Нужно теперь следить за судьбой этого call и смотреть, где нам нужно успеть эту инфу достать. 
+
+
+punt-bindings ничего не испортило. 
 
 

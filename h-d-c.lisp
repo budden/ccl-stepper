@@ -8,6 +8,7 @@
   (pushnew :ncsdbg *features*))
 
 (eval-when (:compile-toplevel :load-toplevel)
+  (intern "STEP-INTO" :cl-user)
   (defpackage :native-code-stepper
     (:use :cl :ccl)
     (:shadowing-import-from :cl-user :step-into)
@@ -89,8 +90,8 @@
                                       break ; bad things would happen
                                       backtrace-as-list
                                       activate-stepping-and-do-first-step
-                                      swank/backend:activate-stepping
-                                      swank/backend:sldb-step-into
+                                      #+SWANK swank/backend:activate-stepping
+                                      #+SWANK swank/backend:sldb-step-into
                                       CCL::RUN-PROCESS-INITIAL-FORM
                                       ccl::%kernel-restart
                                       ;; this call crashed
@@ -113,24 +114,24 @@
     (ccl::cheap-eval nil)
     (funcall nil)
     (ccl::call-check-regs nil)
-    (,(intern "EVAL-FOR-EMACS-RT" :swank) nil)
+    #+SWANK (,(intern "EVAL-FOR-EMACS-RT" :swank) nil)
     (ccl::cbreak-loop nil)
-    (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::TRACK-PACKAGE)| nil)
-    (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::REPL-EVAL)| nil)
+    #+CLCON (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::TRACK-PACKAGE)| nil)
+    #+CLCON (CLCO::|(CLCO::DEF-PATCHED-SWANK-FUN SWANK-REPL::REPL-EVAL)| nil)
     (CCL::BREAK-LOOP-HANDLE-ERROR nil)
     (CCL::%ERROR nil)
     )
   "Stepizibility per symbol takes priority over that of package")
 
 (defparameter *stepizibility-per-package*
-  `((,(find-package :swank) nil)
-    (,(find-package :swank/backend) nil)
-    (,(find-package :swank/ccl) nil)
-    (,(find-package :swank-repl) nil)
-    (,(find-package :clco) :ask-user)
-    (,(find-package :oduvanchik) :ask-user)
+  `(#+SWANK (,(find-package :swank) nil)
+    #+SWANK (,(find-package :swank/backend) nil)
+    #+SWANK (,(find-package :swank/ccl) nil)
+    #+SWANK (,(find-package :swank-repl) nil)
+    #+CLCON (,(find-package :clco) :ask-user)
+    #+CLCON (,(find-package :oduvanchik) :ask-user)
     (,(find-package :native-code-stepper) nil)
-    (,(find-package :ccl) :ask-user)
+    ; (,(find-package :ccl) :ask-user)
     )
   "Order is important, because a symbol can be in many packages. 
 Packages are asked from top to bottom, the first one mentioned yields an answer for the symbol")
@@ -190,6 +191,9 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
   (and (symbolp x)
        (typep (get x 'steppoint-info) 'steppoint-info)))
 
+(defun loud-message (format &rest args)
+  (apply 'warn format args))
+
 (defun stepize-stack ()
   (let ((commands-left-to-stepize 1))
     (dolist (entry (ccl::backtrace-as-list :count 250))
@@ -204,7 +208,7 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
                  nil)
                 (:empty
                  (incf commands-left-to-stepize -1)
-                 (swank/ccl::loud-message "Nothing to stepize in ~S" entry)
+                 (loud-message "Nothing to stepize in ~S" entry)
                  nil)
                 ((nil)
                  (case allowed-to-stepize-p
@@ -355,7 +359,7 @@ FIXME - take from SLIME
      (steppoint-symbol-p-v
       (error "attemp to stepize steppoint-symbol"))
      ((eq function-is-stepized-p-v :empty)
-      (swank/ccl::loud-message "Function ~S to stepize has no steppable points"
+      (loud-message "Function ~S to stepize has no steppable points"
                     function-or-name))
      ((eq function-is-stepized-p-v t)
       ; steppoints are set already - do nothing
@@ -535,5 +539,5 @@ FIXME - take from SLIME
    ((find-restart 'continue)
     (invoke-restart 'continue))
    (t
-    (swank/ccl::loud-message "No continue restart - unable to do the first step. Please invoke an appropriate restart by hand"))))
+    (loud-message "No continue restart - unable to do the first step. Please invoke an appropriate restart by hand"))))
 

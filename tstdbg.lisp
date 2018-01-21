@@ -9,5 +9,7 @@
   
 (defun cl-user::f2 (n)
   (break "SDF")
-  (<= n 4))
+  (if (<= n 4)
+      (print "Hello")
+      (cl-user::f2 8)))
 
