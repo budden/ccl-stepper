@@ -10,7 +10,7 @@
 (eval-when (:compile-toplevel :load-toplevel)
   (defpackage :native-code-stepper
     (:use :cl :ccl)
-    (:shadowing-import-from :cl-user :step-into)
+    #+sbcl (:shadowing-import-from :cl-user :step-into)
     (:export
      #:! ; step given function with args
 
@@ -190,6 +190,10 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
   (and (symbolp x)
        (typep (get x 'steppoint-info) 'steppoint-info)))
 
+;; We had loud-message in swank, but it's gone somehow
+(defun loud-message (&rest args)
+  (apply 'warn args))
+
 (defun stepize-stack ()
   (let ((commands-left-to-stepize 1))
     (dolist (entry (ccl::backtrace-as-list :count 250))
@@ -204,7 +208,7 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
                  nil)
                 (:empty
                  (incf commands-left-to-stepize -1)
-                 (swank/ccl::loud-message "Nothing to stepize in ~S" entry)
+                 (loud-message "Nothing to stepize in ~S" entry)
                  nil)
                 ((nil)
                  (case allowed-to-stepize-p
@@ -331,19 +335,9 @@ FIXME - take from SLIME
 
 
 (defmacro carefully (&body body)
-  `(multiple-value-bind
-       (result second-value)
-       (progn ; ccl::with-other-threads-suspended
-        (ccl::impurify)
-        (ccl::purify)
-        (ccl::impurify)
-        (ignore-errors ; calling error with other threads disabled would kill the IDE. So 
-         (ccl::without-gcing
-          ,@body)))
-     ;; but we should not ignore errors!
-     (when (typep second-value 'condition)
-       (signal second-value))
-     (values result second-value)))
+  "It was intended to run in an exclusive mode, but 
+there's no exclusive mode"
+  `(progn ,@body))
 
 (defun stepize-fn (function-or-name)
   "Find all steppable points from compiled function and set steppoints where possible. Might insert no step points actually, if all calls are not call-allowed-to-stepize-p"
@@ -355,7 +349,7 @@ FIXME - take from SLIME
      (steppoint-symbol-p-v
       (error "attemp to stepize steppoint-symbol"))
      ((eq function-is-stepized-p-v :empty)
-      (swank/ccl::loud-message "Function ~S to stepize has no steppable points"
+      (loud-message "Function ~S to stepize has no steppable points"
                     function-or-name))
      ((eq function-is-stepized-p-v t)
       ; steppoints are set already - do nothing
@@ -535,5 +529,5 @@ FIXME - take from SLIME
    ((find-restart 'continue)
     (invoke-restart 'continue))
    (t
-    (swank/ccl::loud-message "No continue restart - unable to do the first step. Please invoke an appropriate restart by hand"))))
+    (loud-message "No continue restart - unable to do the first step. Please invoke an appropriate restart by hand"))))
 
