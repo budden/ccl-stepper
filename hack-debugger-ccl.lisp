@@ -445,7 +445,7 @@ there's no exclusive mode"
    (ccl::set-nth-immediate fn (+ i ccl::+function-immediate-constants-are-counted-from+) steppoint-symbol))
   (print "after")
   (print steppoint-symbol)
-  (print (ccl::nth-immediate fn 44))
+  ;(print (ccl::nth-immediate fn 44))
   (print (ccl::nth-immediate fn (+ i ccl::+function-immediate-constants-are-counted-from+))))
 
 
@@ -471,6 +471,22 @@ there's no exclusive mode"
                   (stepize-stack)
                   )) ; result does not matter
      ))
+
+#|
+Как поправить? 
+
+1. Отлавливать выход из функции. Выход из функции (пока что) может случиться
+в любой момент, например, с помощью throw, на котором у нас ничего нет. 
+Причём, throw может проскочить весь размеченный для пошаговой отладки стек. 
+
+Единственная защита против этого - это окружать каждый steppoint в unwind-protect,
+независимо от того, находимся ли мы в режиме ходьбы или нет. 
+
+Однако если мы остановились по break и у нас текущая функция не
+была степизирована, то у нас нет unwind-protect и мы не можем надёжно ходить
+в этой функции и во всех функциях ниже по стеку :(
+
+|#
      
 (defun run-steppoint (call-from call-to call-args)
   "Run through steppoint. Break if appropriate. Debugger functions will do the rest"
