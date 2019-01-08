@@ -22,4 +22,4 @@
 
 - `(in-package :NATIVE-CODE-STEPPER)`
 
-- `(! 'fact 2)` - должен появиться отладчик с перезапуском "STEP-INTO"
+- `(! 'ncse:fact 2)` - должен появиться отладчик с перезапуском "STEP-INTO"

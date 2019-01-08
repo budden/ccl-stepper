@@ -8,6 +8,11 @@
   (pushnew :ncsdbg *features*))
 
 (eval-when (:compile-toplevel :load-toplevel)
+  (defpackage :ncse ; native-code-stepper-example
+    (:use)
+    (:export #:fact)))
+
+(eval-when (:compile-toplevel :load-toplevel)
   (defpackage :native-code-stepper
     (:use :cl :ccl)
     #+sbcl (:shadowing-import-from :cl-user :step-into)
@@ -31,7 +36,6 @@
      #:step-into 
      )
     ))
-
 
 (in-package :native-code-stepper)
 
@@ -59,6 +63,7 @@
 
 (defvar *step-into-flag* nil "If it is set after break, first step point inside call is fired.")
 (defvar *step-over-flag* nil "If it is set after brek, next step point in a caller is fired")
+(defvar *step-out-flag* nil)
 
 (defvar *in-stepper-trap-frame-break* nil "When stepping is enabled, we think that all traps are parts of stepper, so we bind the variable to know if we are in the trap. Note that traps set by user will be ignored one step-continue (:sc) command is issued")
 
@@ -149,6 +154,14 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
 
 (defvar *my-gensym-counter* 0 "Ensures that all steppoint symbols are distinct")
 
+(defvar *function-stepizibility-info-cache*
+  ; key - function object
+  ; value:
+   ; has-no-steppable-points ;; means «has no steppable points»
+   ; is-a-steppoint
+   ; stepized-already
+   ; forbidden
+  (make-hash-table :test 'eq :weak :key))
 
 
 ;;----------------------------------------------------------------------------------------------
@@ -161,19 +174,29 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
     ((satisfies steppoint-symbol-p)
      nil)
     (symbol
+     (let ((fn (fboundp call-into)))
      (cond
+      ((null fn) nil)
+      ((gethash fn *function-stepizibility-info-cache*)
+       nil)
       ((null (symbol-package call-into))
+       (cache-stepizibility-info call-into :forbidden)
        nil) ; some setters fall here
       ((member call-into *non-steppable-calls*)
+       (cache-stepizibility-info call-into :forbidden)
        nil)
       (t
        (let ((entry
               (or
                (assoc call-into *stepizibility-per-symbol*)
                (assoc (symbol-package call-into) *stepizibility-per-package*))))
-         (or
-          (not entry)
-          (second entry))))))
+         (cond
+          ((or
+            (not entry)
+            (second entry)) t)
+          (t
+           (cache-stepizibility-info call-into :forbidden)
+           nil)))))))
     #| (function ; FIXME
         (not (member (coerce call-into 'function) *non-steppable-calls* :key (lambda (x) (coerce x 'function))))) |#
     (t ; other constants, e.g. numbers. 
@@ -198,15 +221,18 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
   (let ((commands-left-to-stepize 1))
     (dolist (entry (ccl::backtrace-as-list :count 250))
       (let* ((fn-name-on-stack (first entry))
+             (fn (coerce fn-name-on-stack 'function))
              (allowed-to-stepize-p (call-allowed-to-stepize-p fn-name-on-stack))
              (stepized-already
-              (function-is-stepized-p fn-name-on-stack))
+              (eq
+               (gethash fn *function-stepizibility-info-cache*)
+               :stepized-already))
              (stepize-p
               (ecase stepized-already
                 ((t)
                  (incf commands-left-to-stepize -1)
                  nil)
-                (:empty
+                (:has-no-steppable-points
                  (incf commands-left-to-stepize -1)
                  (loud-message "Nothing to stepize in ~S" entry)
                  nil)
@@ -312,23 +338,6 @@ FIXME - take from SLIME
     (symbol (fboundp x))
     (t nil)))
 
-(defvar *functions-known-to-have-no-stepizable-points*
-  (make-hash-table :test 'eq :weak :key))
-
-(defun function-is-stepized-p (function-or-name)
-  "Are there step point in function now?"
-  (let* ((fn (coerce function-or-name 'function))
-         (known-to-have-no-stepizable-points
-          (gethash fn *functions-known-to-have-no-stepizable-points*))
-         (actually-stepized-p 
-          (ccl::lfunloop for reference in fn
-                         when (steppoint-symbol-p reference)
-                         return t)))
-    (cond
-     (actually-stepized-p t)
-     (known-to-have-no-stepizable-points :empty)
-     (t nil))))
-
 (defun function-constants (fn)
   (ccl::lfunloop for reference in (coerce fn 'function)
                  collect reference))
@@ -341,65 +350,76 @@ there's no exclusive mode"
 
 (defun stepize-fn (function-or-name)
   "Find all steppable points from compiled function and set steppoints where possible. Might insert no step points actually, if all calls are not call-allowed-to-stepize-p"
-  #+ncsdbg (format t "~%stepizing ~S~%" function-or-name)
-  (let ((steppoint-symbol-p-v (steppoint-symbol-p function-or-name))
-        (function-is-stepized-p-v
-         (function-is-stepized-p function-or-name)))
-    (cond
-     (steppoint-symbol-p-v
-      (error "attemp to stepize steppoint-symbol"))
-     ((eq function-is-stepized-p-v :empty)
-      (loud-message "Function ~S to stepize has no steppable points"
-                    function-or-name))
-     ((eq function-is-stepized-p-v t)
-      ; steppoints are set already - do nothing
-      )
-     (t
-      (let* ((start ccl::+function-immediate-constants-are-counted-from+)
-             (fn (coerce function-or-name 'function))
-             (no-of-steppoints 0))
-        (multiple-value-bind
-            (indices last-index)
-            (carefully 
-             (ccl::lfunloop
-              for reference in fn for i from start
-              do (when (typep reference
-                              '(cons
-                                (eql ccl::indices-of-function-references-in-constant-array)))
-                   (return (values (cdr reference) i)))))
-          (warn "Indices = ~S, constants = ~S" indices (function-constants fn))
-          (cond
-           (indices
-            (let* ((references
-                    (make-array (+ last-index 1) :initial-element nil))
-                   (non-references
-                    (make-array (+ last-index 1) :initial-element nil))) ; may be longer than needed
-              (carefully
-               (ccl::lfunloop for reference in fn
-                              for our-ref-array-index from 0
-                              for immediate-num from start
-                              do (cond
-                                  ((member immediate-num indices)
-                                   (setf (aref references our-ref-array-index) reference))
-                                  )))
-              (pprint references)
-              (pprint non-references)
-              ;(warn "references = ~S" references)
-              (loop
-                for reference across references
-                for our-ref-array-index from 0
-                for immediate-num from start
-                do (when (member immediate-num indices)
-                     (unless (function-designator-p reference)
-                       (error "Something wrong - attempting to stepise a non-function-designator ~S" reference))
-                     (when (call-allowed-to-stepize-p reference)
-                       (progn
-                         #+ncsdbg (format t "~&stepizing ~S -> ~S~%" fn reference)
-                         (stepize-fn-for-one-called fn reference
-                                                    (- immediate-num start))
-                         (incf no-of-steppoints)))))))
-           (t
-            (warn "Unable to stepize ~S - it has no steppable points" function-or-name)))))))))
+  #+ncsdbg (format t "~%stepizing «~S»~%" function-or-name)
+  (let* ((function (coerce function-or-name 'function))
+         (info (gethash function
+                        *function-stepizibility-info-cache*)))
+    (ecase info
+      (:has-no-steppable-points
+       #+ncsdbg (format t "~&«~S» has no steppoints - no work~%" function))
+      (:is-a-steppoint
+       (error "attempt to stepize steppoint-symbol"))
+      (:stepized-already
+       #+ncsdbg (format t "~&«~S» stepized already - skpping~%" function))
+      (:forbidden
+       #+ncsdbg (format t "~&«~S» is forbidden to stepize - skpping~%" function))
+      ((nil)
+       (stepize-fn-inner function-or-name)
+      ))))
+
+(defun cache-stepizibility-info (function-or-name info)
+  (setf (gethash function-or-name *function-stepizibility-info-cache*)
+        info))
+
+(defun stepize-fn-inner (function-or-name)
+  (let* ((start ccl::+function-immediate-constants-are-counted-from+)
+         (fn (coerce function-or-name 'function))
+         (no-of-steppoints 0))
+    (multiple-value-bind
+        (indices last-index)
+        (carefully 
+         (ccl::lfunloop
+          for reference in fn for i from start
+          do (when (typep reference
+                          '(cons
+                            (eql ccl::indices-of-function-references-in-constant-array)))
+               (return (values (cdr reference) i)))))
+      (warn "Indices = ~S, constants = ~S" indices (function-constants fn))
+      (cond
+       (indices
+        (let* ((references
+                (make-array (+ last-index 1) :initial-element nil))
+               (non-references
+                (make-array (+ last-index 1) :initial-element nil))) ; may be longer than needed
+          (carefully
+           (ccl::lfunloop for reference in fn
+                          for our-ref-array-index from 0
+                          for immediate-num from start
+                          do (cond
+                              ((member immediate-num indices)
+                               (setf (aref references our-ref-array-index) reference))
+                              )))
+          (pprint references)
+          (pprint non-references)
+          ;(warn "references = ~S" references)
+          (loop
+            for reference across references
+            for our-ref-array-index from 0
+            for immediate-num from start
+            do (when (member immediate-num indices)
+                 (unless (function-designator-p reference)
+                   (error "Something wrong - attempting to stepise a non-function-designator ~S" reference))
+                 (when (call-allowed-to-stepize-p reference)
+                   (progn
+                     #+ncsdbg (format t "~&stepizing call from ~S to ~S~%" fn reference)
+                     (stepize-fn-for-one-called fn reference
+                                                (- immediate-num start))
+                     (incf no-of-steppoints)))))
+          (cache-stepizibility-info fn :stepized-already)
+          ))
+       (t
+        (cache-stepizibility-info fn :has-no-steppable-points)
+        #+ncsdbg (format t "~&~S has no steppable points~%" fn))))))
   
 (defun stepize-fn-for-one-called (fn reference i)
   "fn is a function, reference is a function-designator-p . Set steppoints for one reference. 
@@ -429,6 +449,7 @@ there's no exclusive mode"
       (setf (get steppoint-symbol 'steppoint-info)
             (make-steppoint-info :fn fn :old-called reference))
       (setf (symbol-function steppoint-symbol) steppoint)
+      (cache-stepizibility-info fn :is-a-steppoint)
       (set-steppoints-for-one-called-in-an-fn fn i steppoint-symbol)
       (push steppoint-symbol *active-steppoints*)
       (values reference steppoint))))
@@ -450,6 +471,7 @@ there's no exclusive mode"
 
 
 (defmacro with-stepper-restarts (&body body)
+  "Ссылается на лок.переменные из run-steppoint"
   `(let ( ; bindings for break only
          ; (*step-into-flag* nil) 
          #|
@@ -463,7 +485,15 @@ there's no exclusive mode"
          (let (#+SWANK (swank::*sldb-quit-restart* (find-restart 'step-continue)))
            ,@body
            )
-       ; (step-out )
+       (go-out () #|:test (lambda (ситуация) (declare (ignore ситуация)) *можно-выйти-наверх*)|#
+                 :report "Step out"
+                 (cond
+                  (*можно-выйти-наверх*
+                   (setf-*stepping-enabled* nil)
+                   (setf *step-out-flag* t))
+                  (t
+                   (warn "Из этой функции нельзя выйти наверх. Пойдём внутрь")
+                   (setf-*stepping-enabled* t))))
        ; (step-next )
        (step-into ()
                   :report "Step"
@@ -488,29 +518,33 @@ there's no exclusive mode"
 
 |#
      
+(defvar *можно-выйти-наверх* nil)
+
 (defun run-steppoint (call-from call-to call-args)
   "Run through steppoint. Break if appropriate. Debugger functions will do the rest"
   (when *tracing-enabled*
     (format t "~&native stepper break, from ~S~
                ~% into ~S, args=~S~%" call-from call-to call-args))
-  (cond
-   (*stepping-enabled*
-    (let ( ; bindings for both break and apply
-          (*step-over-flag* nil)
-          )
+  (let (result-values-list)
+    (when *stepping-enabled*
       (with-stepper-restarts
        (break "Step: before call from ~S~
                ~%  to ~S with args=~S~%"
-              call-from call-to call-args))
-      (let ((result (multiple-value-list (apply call-to call-args))))
+              call-from call-to call-args)))
+    (stepize-fn call-to) ; надо, чтобы после кеширования это происходило ОЧЕНЬ быстро!
+    (let ((*step-out-flag* nil))
+      (unwind-protect
+          (let ((*можно-выйти-наверх* t))
+            (setq result-values-list (multiple-value-list (apply call-to call-args))))
+        (when *step-out-flag*
+          (setf-*stepping-enabled* t)
+          (setq *step-out-flag* nil))
         (when *stepping-enabled*
           (with-stepper-restarts
            (break "Step after: call from ~S~
                    ~%  to ~S returned (values~{ ~S~})"
-                  call-from call-to result)))
-        (values-list result))))
-   (t
-    (apply call-to call-args))))
+                  call-from call-to result-values-list)))))
+    (values-list result-values-list)))
 
 ;;-------------------------------------------------------
 ;;-------------------------------- INTERFACE ------------
@@ -521,9 +555,9 @@ there's no exclusive mode"
   (let ((*stepping-enabled* t))
     (apply function args)))
 
-(defun fact (n)
+(defun ncse:fact (n)
   (if (<= n 1) 1
-      (* n (fact (- n 1)))))
+      (* n (ncse:fact (- n 1)))))
 
 (defun stop-stepping ()
   (setf *stepping-enabled* nil))
