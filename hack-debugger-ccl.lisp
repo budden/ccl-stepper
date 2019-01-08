@@ -175,32 +175,42 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
      nil)
     (symbol
      (let ((fn (fboundp call-into)))
-     (cond
-      ((null fn) nil)
-      ((gethash fn *function-stepizibility-info-cache*)
-       nil)
-      ((null (symbol-package call-into))
-       (cache-stepizibility-info call-into :forbidden)
-       nil) ; some setters fall here
-      ((member call-into *non-steppable-calls*)
-       (cache-stepizibility-info call-into :forbidden)
-       nil)
-      (t
-       (let ((entry
-              (or
-               (assoc call-into *stepizibility-per-symbol*)
-               (assoc (symbol-package call-into) *stepizibility-per-package*))))
-         (cond
-          ((or
-            (not entry)
-            (second entry)) t)
-          (t
-           (cache-stepizibility-info call-into :forbidden)
-           nil)))))))
+       (cond
+        ((null fn) nil)
+        (t
+         (let ((status (gethash fn *function-stepizibility-info-cache*)))
+           (ecase status
+             (:forbidden nil) ; на самом деле есть два запрета
+           ; - запрет степизировать вызов и запрет степизировать саму функцию!
+             ((:has-no-steppable-points :is-a-steppoint :stepized-already)
+              t)
+             ((nil)
+              (cond
+               ((null (symbol-package call-into))
+                (cache-stepizibility-info call-into :forbidden)
+                nil) ; some setters fall here
+               ((member call-into *non-steppable-calls*)
+                (cache-stepizibility-info call-into :forbidden)
+                nil)
+               (t
+                (call-allowed-to-stepize-by-function-name-p call-into fn))))))))))
     #| (function ; FIXME
         (not (member (coerce call-into 'function) *non-steppable-calls* :key (lambda (x) (coerce x 'function))))) |#
     (t ; other constants, e.g. numbers. 
-     nil)))
+       nil)))
+
+(defun call-allowed-to-stepize-by-function-name-p (call-into call-into-as-fn)
+  (let ((entry
+         (or
+          (assoc call-into *stepizibility-per-symbol*)
+          (assoc (symbol-package call-into) *stepizibility-per-package*))))
+    (cond
+     ((or
+       (not entry)
+       (second entry)) t)
+     (t
+      (cache-stepizibility-info call-into-as-fn :forbidden)
+      nil))))
 
 (defun make-long-living-symbol (name)
   (progn 
@@ -485,14 +495,16 @@ there's no exclusive mode"
          (let (#+SWANK (swank::*sldb-quit-restart* (find-restart 'step-continue)))
            ,@body
            )
-       (go-out () #|:test (lambda (ситуация) (declare (ignore ситуация)) *можно-выйти-наверх*)|#
+       ;; не можем сделать step-out, т.к. тогда оно попадёт
+       ;; в меню и не будет видно, можно ли выходить или нет
+       (step-out-1 () :test (lambda (ситуация) (declare (ignore ситуация)) *можно-выйти-наверх*)
                  :report "Step out"
                  (cond
                   (*можно-выйти-наверх*
                    (setf-*stepping-enabled* nil)
                    (setf *step-out-flag* t))
                   (t
-                   (warn "Из этой функции нельзя выйти наверх. Пойдём внутрь")
+                   (warn "Странно - наверх выходить некуда, а функция есть")
                    (setf-*stepping-enabled* t))))
        ; (step-next )
        (step-into ()
