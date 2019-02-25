@@ -47,27 +47,16 @@
 
 
 (defparameter *tracing-enabled* nil "If true, step points are printed")
-(defparameter *stepping-enabled* nil ; FIXME this is defparameter as we unable to reset it when stepping out
-  ; of lowest steppable frame. So if we switched from execution to stepping we normally dont' switch back until 
-  ; user issues "step-continue" command at some point.
-  ; Possible solution is to put advice on invoke-debugger
+
+(defparameter *stepping-enabled* nil 
   "Enable/disable stepping. If this is true and *step-into-flag* is t, then step points break execution.")
 
 ;; push '(*stepping-enabled*) and '(*tracing-enabled*) to process-initial-bindings
   
-(defvar *in-run-steppoint* nil "Bound to t in a call to (break) made inside run-steppoint")
 (defvar *stepped-source-is-shown-already-in-the-debugger* nil
   "When debugger is opened and dbg::debugger-select-frame is called for the first time, we try to find and show stepped source")
 
-(defvar *stepper-call-to* nil)
-
-(defvar *step-into-flag* nil "If it is set after break, first step point inside call is fired.")
-(defvar *step-over-flag* nil "If it is set after brek, next step point in a caller is fired")
 (defvar *step-out-flag* nil)
-
-(defvar *in-stepper-trap-frame-break* nil "When stepping is enabled, we think that all traps are parts of stepper, so we bind the variable to know if we are in the trap. Note that traps set by user will be ignored one step-continue (:sc) command is issued")
-
-(defvar *trace-break-function* nil "Bound in the scope of our advice to compiler::trace-break")
 
 ; FIXME this is a trash! Replace with a weak hash-table where weak key is a stepped function object and value is nil
 (defvar *active-steppoints* nil "list of created breakpoints")
@@ -228,6 +217,7 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
   (apply 'warn args))
 
 (defun stepize-stack ()
+  "Подготавливает к шаганию эту функцию и до 250 тех, кто её вызвал"
   (let ((commands-left-to-stepize 1))
     (dolist (entry (ccl::backtrace-as-list :count 250))
       (let* ((fn-name-on-stack (first entry))
@@ -259,76 +249,6 @@ Packages are asked from top to bottom, the first one mentioned yields an answer 
       (when (eql commands-left-to-stepize 0)
         (return)))))
   
-;;----------------------------------------------------------------------------------------------
-;;---- STUDY OF STACK FRAMES AND OPERATIONS ON THEM ------------------------------------------------------------
-;;----------------------------------------------------------------------------------------------
-#|
-
-FIXME - take from SLIME
-
- (defun frm-get-some-frame ()
-  (assert dbg::*debugger-stack*)
-  (slot-value DBG::*debugger-stack* 'DBG::current-frame)
-  )
-
-
- (defun frm-top-frame (&optional initial-frame)
-  "Top of debugger stack"
-  (setf initial-frame (or initial-frame (frm-get-some-frame)))
-  (do ((this initial-frame r)
-       (r initial-frame (slot-value r 'dbg::prev)))
-      ((null r) this)))
-
- (defun frm-never-stop-complex-name-p (name)
-  "Some forms are parts of stepper. Never stop on them, 
-  never show their source"
-  (and
-   (consp name)
-   (or
-    (eq (third name) 'stepize-fn-for-one-called)
-    ;(equalp name '(subfunction 1 compiler::get-encapsulator))
-    (some 'symbol-of-package-not-for-stepping-p
-          (cdr name))
-    ;(member 'DBG::dbg-trap-frame-break name)
-    (and
-     (consp (third name))
-     (frm-never-stop-complex-name-p (third name))
-     ;(member 'DBG::dbg-trap-frame-break (third name))
-    ))))
-
- (defun frm-stepizible-frame-p (frame)
-  (when (slot-exists-p frame 'dbg::function-name)
-    (let ((fn-name (slot-value frame 'dbg::function-name)))
-      (stepizible-function-name-p fn-name)
-      )))
-
- (defun frm-find-topmost-stepizible-frame (down-from-frame)
-  "Find potentially steppable fn on debugger stack below from given frame"
-  ;(let ((top (frm-top-frame down-from-frame)))
-  (do ((frame down-from-frame (slot-value frame 'dbg::%next)))
-      ((null frame) nil)
-    (when (frm-stepizible-frame-p frame)
-      (return-from frm-find-topmost-stepizible-frame frame))
-    ))
-
- (defun frm-stepize-stepizible-frame (frame)
-  (stepize-fn (slot-value frame 'DBG::function-name)))
-
-
- (defun frm-find-supposed-stepped-frame (any-frame-in-stack)
-  "Find a frame we are likely to step. Down-from should be top of the stack"
-  (let ((our-frame
-         (frm-find-topmost-stepizible-frame (frm-top-frame any-frame-in-stack))
-              ; this is currently stepped frame as *in-run-steppoint* is t, hence (run-steppoint)->(break) is on the stack
-         ))
-    (when (and our-frame *in-stepper-trap-frame-break*)
-      (setf our-frame
-            (frm-find-topmost-stepizible-frame our-frame))) ; do it twice: frame exited is hidden
-    our-frame
-    ))
-
-|#
-
  
 
 ;;----------------------------------------------------------------------------------------------
@@ -480,83 +400,70 @@ there's no exclusive mode"
   (print (ccl::nth-immediate fn (+ i ccl::+function-immediate-constants-are-counted-from+))))
 
 
-(defmacro with-stepper-restarts (&body body)
+(defvar *последнее-повеление* :undefined) 
+
+(defmacro with-stepper-restarts ((перед-вызовом-ли) &body body)
   "Ссылается на лок.переменные из run-steppoint"
-  `(let ( ; bindings for break only
-         ; (*step-into-flag* nil) 
-         #|
-         (DBG::*hidden-symbols*
-          (append '(break run-steppoint invoke-debugger stepize-fn-for-one-called) DBG::*hidden-symbols*)) |#
-         (*stepper-call-to* call-to)
-         (*in-run-steppoint* t)
-         (*stepped-source-is-shown-already-in-the-debugger* nil))
+  `(let ((*stepped-source-is-shown-already-in-the-debugger* nil))
      (setf-*stepping-enabled* nil)
+     (assert (not (eq *последнее-повеление* :undefined)) () "В треде при пошаговой отладке должно быть задано *последнее-повеление*")
+     ;; если не выбрано шагать, то считаем, что надо продолжать
+     (setq *последнее-повеление* 'step-continue)
+     (stepize-stack)
      (restart-case
          (let (#+SWANK (swank::*sldb-quit-restart* (find-restart 'step-continue)))
            ,@body
            )
-       ;; не можем сделать step-out, т.к. тогда оно попадёт
-       ;; в меню и не будет видно, можно ли выходить или нет
-       (step-out-1 () :test (lambda (ситуация) (declare (ignore ситуация)) *можно-выйти-наверх*)
-                 :report "Step out"
-                 (cond
-                  (*можно-выйти-наверх*
-                   (setf-*stepping-enabled* nil)
-                   (setf *step-out-flag* t))
-                  (t
-                   (warn "Странно - наверх выходить некуда, а функция есть")
-                   (setf-*stepping-enabled* t))))
-       ; (step-next )
-       (step-into ()
-                  :report "Step"
-                  (setf-*stepping-enabled* t)
-                  (stepize-stack)
-                  )) ; result does not matter
+       (step-next
+        ()
+        :report
+        (lambda (поток)
+          (format поток "~S"
+                  (if ,перед-вызовом-ли 
+                      "Переступи и покажи итог"
+                      "Переступи (= шагни)")))
+        (setq *последнее-повеление* 'step-next))
+       (step-into 
+        () :report (lambda (поток)
+                     (format поток "~S"
+                             (if ,перед-вызовом-ли 
+                                 "Зайди"
+                                 "Зайди (= шагни)")))
+        (setq *последнее-повеление* 'step-into))
+       (step-continue 
+        () :report "Беги"
+        (setq *последнее-повеление* 'step-continue)
+        )) ; result does not matter
      ))
 
-#|
-Как поправить? 
-
-1. Отлавливать выход из функции. Выход из функции (пока что) может случиться
-в любой момент, например, с помощью throw, на котором у нас ничего нет. 
-Причём, throw может проскочить весь размеченный для пошаговой отладки стек. 
-
-Единственная защита против этого - это окружать каждый steppoint в unwind-protect,
-независимо от того, находимся ли мы в режиме ходьбы или нет. 
-
-Однако если мы остановились по break и у нас текущая функция не
-была степизирована, то у нас нет unwind-protect и мы не можем надёжно ходить
-в этой функции и во всех функциях ниже по стеку :(
-
-|#
-     
 (defvar *можно-выйти-наверх* nil)
 
 (defun run-steppoint (call-from call-to call-args)
-  "Run through steppoint. Break if appropriate. Debugger functions will do the rest"
+  "Есть точка вызова, за которую мы уже зацепились. Пройти её - отладка может быть включена или выключена"
   (when *tracing-enabled*
     (format t "~&native stepper break, from ~S~
                ~% into ~S, args=~S~%" call-from call-to call-args))
   (let (result-values-list)
-    (when *stepping-enabled*
+    (unless (eq *последнее-повеление* 'step-continue)
       (with-stepper-restarts
+       (t)
        (break "Step: before call from ~S~
                ~%  to ~S with args=~S~%"
               call-from call-to call-args)))
-    (stepize-fn call-to) ; надо, чтобы после кеширования это происходило ОЧЕНЬ быстро!
-    (let ((*step-out-flag* nil))
-      (unwind-protect
-          (let ((*можно-выйти-наверх* t))
-            (setq result-values-list (multiple-value-list (apply call-to call-args))))
-        (when *step-out-flag*
-          (setf-*stepping-enabled* t)
-          (setq *step-out-flag* nil))
-        (when *stepping-enabled*
-          (with-stepper-restarts
-           (break "Step after: call from ~S~
-                   ~%  to ~S returned (values~{ ~S~})"
-                  call-from call-to result-values-list)))))
-    (values-list result-values-list)))
+    (ecase *последнее-повеление*
+      ((step-into step-continue)
+       (stepize-fn call-to) ; надо, чтобы после кеширования это происходило ОЧЕНЬ быстро!
+       (apply call-to call-args))
+      (step-next
+       (setq *последнее-повеление* 'step-continue )
+       (setq result-values-list (multiple-value-list (apply call-to call-args)))
+       ; *последнее-повеление* могло поменяться внутри функции
+       ; мы игнорируем step-continue, т.е. заказ на итог - это как бы 
+       ; точка останова
+       (with-stepper-restarts
+        (nil)
+        (break "Итог: вызов ~S вернул ~{~S~%~}" call-to result-values-list))
+       (values-list result-values-list)))))
 
 ;;-------------------------------------------------------
 ;;-------------------------------- INTERFACE ------------
@@ -564,26 +471,20 @@ there's no exclusive mode"
 (defun ! (function &rest args)
   "Step function with args"
   (stepize-fn function)
-  (let ((*stepping-enabled* t))
-    (apply function args)))
+  (setf *последнее-повеление* 'step-into)
+  (apply function args))
 
 (defun ncse:fact (n)
   (if (<= n 1) 1
       (* n (ncse:fact (- n 1)))))
 
 (defun stop-stepping ()
-  (setf *stepping-enabled* nil))
-
-(defun t2 ()
-  (stepize-fn 'ccl::compile-named-function)
-  (let ((*stepping-enabled* t))
-    (eval '(compile (defun f () (print 'list))))))
-
+  (setf *последнее-повеление* 'step-continue))
 
 (defun activate-stepping-and-do-first-step (frame)
   (declare (ignore frame))
   (assert (not *stepping-enabled*))
-  (setf *stepping-enabled* t)
+  (setf *последнее-повеление* 'step-into)
   ;; (pprint (ccl::backtrace-as-list :count 50))
   ;; FIXME - see FIXME near other use of stepize-stack
   (stepize-stack)
